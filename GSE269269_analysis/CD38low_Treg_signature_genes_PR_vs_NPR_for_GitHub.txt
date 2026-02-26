@@ -1,0 +1,95 @@
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+})
+
+# ===== inputs =====
+az_rds    <- "seurat_out/GSE269269_azimuth_pbmc.rds"   
+high_file <- "INPUT_FILE" #text file of CD38low Treg-upregulated gene list             
+
+outdir <- "module_PR_vs_NPR_AzimuthL2_Treg_high"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ===== load =====
+obj <- readRDS(az_rds)
+
+DefaultAssay(obj) <- "RNA"
+obj <- JoinLayers(obj, assay = "RNA")
+
+# ===== Treg extraction (Azimuth l2) =====
+treg <- subset(obj, subset = predicted.celltype.l2 == "Treg")
+message("Treg cells (Azimuth l2): ", ncol(treg))
+
+# ===== read gene set =====
+read_genes <- function(f) {
+  g <- readLines(f, warn = FALSE)
+  g <- trimws(g)
+  g <- g[g != ""]
+  unique(g)
+}
+
+genes_high <- read_genes(high_file)
+genes_high_use <- intersect(genes_high, rownames(treg))
+
+# overlap report
+ov <- data.frame(
+  set = "high_in_low1",
+  n_input = length(genes_high),
+  n_matched = length(genes_high_use)
+)
+write.table(ov, file = file.path(outdir, "geneset_overlap.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# ===== module score (high only) =====
+DefaultAssay(treg) <- "RNA"
+treg <- AddModuleScore(treg, features = list(genes_high_use), name = "HighInLow1_")
+treg$module_high_in_low1 <- treg$HighInLow1_1
+
+# ===== PR vs NPR comparison =====
+stopifnot(all(c("condition", "sample") %in% colnames(treg@meta.data)))
+
+df <- FetchData(treg, vars = c("sample", "condition", "module_high_in_low1"))
+
+# --- sample-level means (recommended) ---
+df_s <- df %>%
+  group_by(sample, condition) %>%
+  summarise(
+    n_cells = n(),
+    mean_high = mean(module_high_in_low1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.table(df_s, file = file.path(outdir, "Treg_module_high_by_sample.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# stats (5 vs 5 sample means)
+wilcox_high <- wilcox.test(mean_high ~ condition, data = df_s)
+
+sink(file.path(outdir, "stats_wilcox_samplelevel.txt"))
+cat("Wilcox test (sample-level means)\n")
+cat("High module: p=", wilcox_high$p.value, "\n\n")
+print(df_s)
+sink()
+
+# plot (sample-level)
+p_high <- ggplot(df_s, aes(x = condition, y = mean_high)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, height = 0, size = 2) +
+  theme_bw(base_size = 13) +
+  ggtitle(paste0("Azimuth l2 Treg: high_in_low1 (p=", signif(wilcox_high$p.value, 3), ")")) +
+  xlab("") + ylab("Sample-mean module score")
+
+ggsave(file.path(outdir, "Box_high_samplelevel.png"),
+       p_high, width = 5.5, height = 4.5, dpi = 300)
+
+# reference: cell-level violin
+p_vln <- VlnPlot(treg, features = "module_high_in_low1", group.by = "condition", pt.size = 0) +
+  ggtitle("Azimuth l2 Treg: high_in_low1 (cell-level)")
+ggsave(file.path(outdir, "Vln_high_celllevel.png"),
+       p_vln, width = 6, height = 4.5, dpi = 300)
+
+# save Treg object
+saveRDS(treg, file = file.path(outdir, "GSE269269_Treg_AzimuthL2_high.rds"))
+
+message("Done: ", normalizePath(outdir))
